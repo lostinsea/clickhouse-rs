@@ -29,6 +29,7 @@ use crate::{
             numeric::VectorColumnData,
             simple_agg_func::SimpleAggregateFunctionColumnData,
             string::StringColumnData,
+            temporal::{Date32ColumnData, Time64ColumnData},
             ArcColumnWrapper, BoxColumnWrapper, ColumnWrapper,
         },
         decimal::NoBits,
@@ -77,6 +78,7 @@ impl dyn ColumnData {
             "Float64" | "Double" => W::wrap(VectorColumnData::<f64>::load(reader, size)?),
             "String" | "Char" | "Varchar" | "Text" | "TinyText" | "MediumText" | "LongText" | "Blob" | "TinyBlob" | "MediumBlob" | "LongBlob" => W::wrap(StringColumnData::load(reader, size)?),
             "Date" => W::wrap(DateColumnData::<u16>::load(reader, size, tz)?),
+            "Date32" => W::wrap(Date32ColumnData::load(reader, size)?),
             "IPv4" => W::wrap(IpColumnData::<Ipv4>::load(reader, size)?),
             "IPv6" => W::wrap(IpColumnData::<Ipv6>::load(reader, size)?),
             "UUID" => W::wrap(IpColumnData::<Uuid>::load(reader, size)?),
@@ -103,6 +105,9 @@ impl dyn ColumnData {
                 } else if let Some((precision, timezone)) = parse_date_time64(type_name) {
                     let column_timezone = get_timezone(&timezone, tz)?;
                     W::wrap(DateTime64ColumnData::load(reader, size, precision, column_timezone)?)
+                } else if type_name.starts_with("Time64") {
+                    let precision = parse_time64(type_name)?;
+                    W::wrap(Time64ColumnData::load(reader, size, precision)?)
                 } else if let Some((func, inner_type)) = parse_simple_agg_fun(type_name) {
                     W::wrap(SimpleAggregateFunctionColumnData::load(reader, func, inner_type, size, tz)?)
                 } else if let Some(inner_type) = parse_low_cardinality(type_name) {
@@ -144,6 +149,10 @@ impl dyn ColumnData {
             SqlType::Uuid => W::wrap(IpColumnData::<Uuid>::with_capacity(capacity)),
 
             SqlType::Date => W::wrap(DateColumnData::<u16>::with_capacity(capacity, timezone)),
+            SqlType::Date32 => W::wrap(Date32ColumnData::with_capacity(capacity)),
+            SqlType::Time64(precision) => {
+                W::wrap(Time64ColumnData::with_capacity(capacity, precision.get())?)
+            }
             SqlType::DateTime(DateTimeType::DateTime64(precision, timezone)) => W::wrap(
                 DateTime64ColumnData::with_capacity(capacity, precision, timezone),
             ),
@@ -240,6 +249,22 @@ impl dyn ColumnData {
             }
         })
     }
+}
+
+fn parse_time64(source: &str) -> Result<u8> {
+    let digits = source
+        .strip_prefix("Time64(")
+        .and_then(|body| body.strip_suffix(')'))
+        .map(str::trim)
+        .ok_or_else(|| format!("Invalid Time64 column type \"{source}\"."))?;
+    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return Err(format!("Invalid Time64 precision in \"{source}\".").into());
+    }
+    let precision: u8 = digits
+        .parse()
+        .map_err(|_| format!("Invalid Time64 precision in \"{source}\"."))?;
+    crate::types::Time64Precision::new(precision)?;
+    Ok(precision)
 }
 
 fn parse_fixed_string(source: &str) -> Option<usize> {
@@ -542,7 +567,9 @@ fn parse_low_cardinality(source: &str) -> Option<&str> {
 fn get_timezone(timezone: &Option<String>, tz: Tz) -> Result<Tz> {
     match timezone {
         None => Ok(tz),
-        Some(t) => t.parse().map_err(|e| crate::errors::Error::Other(format!("invalid timezone: {e}").into())),
+        Some(t) => t
+            .parse()
+            .map_err(|e| crate::errors::Error::Other(format!("invalid timezone: {e}").into())),
     }
 }
 

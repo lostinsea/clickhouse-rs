@@ -12,7 +12,7 @@ use crate::{
     types::{
         column::datetime64::to_datetime,
         value::{decode_ipv4, decode_ipv6},
-        Decimal, Enum16, Enum8, SqlType, ValueRef,
+        Date32, Decimal, Enum16, Enum8, SqlType, Time64, ValueRef,
     },
 };
 
@@ -209,7 +209,11 @@ from_sql_vec_impl! {
     String: SqlType::String => |r| r.as_string(),
     &'a [u8]: SqlType::String => |r| r.as_bytes(),
     Vec<u8>: SqlType::String => |r| r.as_bytes().map(<[u8]>::to_vec),
-    NaiveDate: SqlType::Date => |r| Ok(r.into()),
+    NaiveDate: SqlType::Date | SqlType::Date32 => NaiveDate::from_sql,
+    Date32: SqlType::Date32 => Date32::from_sql,
+    Time64: SqlType::Time64(_) => Time64::from_sql,
+    Option<Date32>: SqlType::Nullable(SqlType::Date32) => Option::<Date32>::from_sql,
+    Option<Time64>: SqlType::Nullable(SqlType::Time64(_)) => Option::<Time64>::from_sql,
     DateTime<Tz>: SqlType::DateTime(_) => |r| Ok(r.into()),
     Enum8: SqlType::Enum8(_) => |r| Ok(r.into()),
     Enum16: SqlType::Enum16(_) => |r| Ok(r.into())
@@ -303,6 +307,7 @@ impl<'a> FromSql<'a> for NaiveDate {
             ValueRef::Date(v) => NaiveDate::from_ymd_opt(1970, 1, 1)
                 .map(|unix_epoch| unix_epoch + Duration::days(v.into()))
                 .ok_or(Error::FromSql(FromSqlError::OutOfRange)),
+            ValueRef::Date32(v) => v.to_naive_date(),
             _ => {
                 let from = SqlType::from(value).to_string();
                 Err(Error::FromSql(FromSqlError::InvalidType {
@@ -310,6 +315,30 @@ impl<'a> FromSql<'a> for NaiveDate {
                     dst: "NaiveDate".into(),
                 }))
             }
+        }
+    }
+}
+
+impl<'a> FromSql<'a> for Date32 {
+    fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Date32(value) => Ok(value),
+            _ => Err(Error::FromSql(FromSqlError::InvalidType {
+                src: SqlType::from(value).to_string(),
+                dst: SqlType::Date32.to_string(),
+            })),
+        }
+    }
+}
+
+impl<'a> FromSql<'a> for Time64 {
+    fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Time64(value) => Ok(value),
+            _ => Err(Error::FromSql(FromSqlError::InvalidType {
+                src: SqlType::from(value).to_string(),
+                dst: "Time64".into(),
+            })),
         }
     }
 }

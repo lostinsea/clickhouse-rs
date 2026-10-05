@@ -18,7 +18,6 @@ use crate::{
             fixed_string::{FixedStringAdapter, NullableFixedStringAdapter},
             ip::{IpColumnData, Ipv4, Ipv6},
             iter::Iterable,
-            low_cardinality::LowCardinalityColumnData,
             simple_agg_func::SimpleAggregateFunctionColumnData,
             string::StringAdapter,
         },
@@ -29,6 +28,7 @@ use crate::{
 
 use self::chunk::ChunkColumnData;
 pub use self::column_data::ColumnData;
+pub(crate) use self::low_cardinality::LowCardinalityColumnData;
 pub(crate) use self::string_pool::StringPool;
 pub use self::{concat::ConcatColumnData, numeric::VectorColumnData};
 
@@ -48,11 +48,14 @@ pub mod iter;
 mod list;
 mod low_cardinality;
 mod map;
+#[cfg(test)]
+mod native_date32_time64_tests;
 mod nullable;
 mod numeric;
 mod simple_agg_func;
 mod string;
 mod string_pool;
+pub(crate) mod temporal;
 mod util;
 
 /// Represents Clickhouse Column
@@ -247,6 +250,7 @@ impl<K: ColumnType> Column<K> {
     }
 
     pub(crate) fn cast_to(self, dst_type: SqlType) -> Result<Self> {
+        LowCardinalityColumnData::ensure_writable_type(&dst_type)?;
         let src_type = self.sql_type();
 
         if dst_type == src_type {
@@ -255,6 +259,13 @@ impl<K: ColumnType> Column<K> {
 
         match (dst_type.clone(), src_type.clone()) {
             (SqlType::LowCardinality(inner), src_type) if src_type.is_inner_low_cardinality() => {
+                if (src_type.contains_native_temporal() || inner.contains_native_temporal())
+                    && src_type != *inner
+                {
+                    return self
+                        .cast_to(inner.clone())?
+                        .cast_to(SqlType::LowCardinality(inner));
+                }
                 let name = self.name().to_owned();
                 let tz = self.data.get_timezone().unwrap_or(Tz::Zulu);
                 let mut low_card_data = LowCardinalityColumnData::empty(inner, tz, self.len())?;

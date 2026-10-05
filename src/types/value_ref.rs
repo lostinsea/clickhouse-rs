@@ -17,7 +17,7 @@ use crate::{
         column::datetime64::to_datetime,
         decimal::Decimal,
         value::{decode_ipv4, decode_ipv6, AppDate, AppDateTime},
-        DateTimeType, Enum16, Enum8, SqlType, Value,
+        Date32, DateTimeType, Enum16, Enum8, SqlType, Time64, Value,
     },
 };
 
@@ -53,6 +53,8 @@ pub enum ValueRef<'a> {
         &'static SqlType,
         Arc<HashMap<ValueRef<'a>, ValueRef<'a>>>,
     ),
+    Date32(Date32),
+    Time64(Time64),
 }
 
 impl<'a> Hash for ValueRef<'a> {
@@ -69,6 +71,8 @@ impl<'a> Hash for ValueRef<'a> {
             Self::UInt32(i) => i.hash(state),
             Self::UInt64(i) => i.hash(state),
             Self::UInt128(i) => i.hash(state),
+            Self::Date32(d) => d.hash(state),
+            Self::Time64(t) => t.hash(state),
             _ => unimplemented!(),
         }
     }
@@ -93,6 +97,8 @@ impl<'a> PartialEq for ValueRef<'a> {
             (ValueRef::Float32(a), ValueRef::Float32(b)) => *a == *b,
             (ValueRef::Float64(a), ValueRef::Float64(b)) => *a == *b,
             (ValueRef::Date(a), ValueRef::Date(b)) => *a == *b,
+            (ValueRef::Date32(a), ValueRef::Date32(b)) => *a == *b,
+            (ValueRef::Time64(a), ValueRef::Time64(b)) => *a == *b,
             (ValueRef::DateTime(a, tz_a), ValueRef::DateTime(b, tz_b)) => {
                 let time_a = tz_a.timestamp_opt(i64::from(*a), 0);
                 let time_b = tz_b.timestamp_opt(i64::from(*b), 0);
@@ -155,6 +161,8 @@ impl<'a> fmt::Display for ValueRef<'a> {
                     .unwrap();
                 fmt::Display::fmt(&date.format("%Y-%m-%d"), f)
             }
+            ValueRef::Date32(v) => fmt::Display::fmt(v, f),
+            ValueRef::Time64(v) => fmt::Display::fmt(v, f),
             ValueRef::DateTime(u, tz) if f.alternate() => {
                 let time = tz.timestamp_opt(i64::from(*u), 0).unwrap();
                 write!(f, "{}", time.to_rfc2822())
@@ -220,6 +228,8 @@ impl<'a> From<ValueRef<'a>> for SqlType {
             ValueRef::Float32(_) => SqlType::Float32,
             ValueRef::Float64(_) => SqlType::Float64,
             ValueRef::Date(_) => SqlType::Date,
+            ValueRef::Date32(_) => SqlType::Date32,
+            ValueRef::Time64(value) => SqlType::Time64(value.precision_type()),
             ValueRef::DateTime(_, _) => SqlType::DateTime(DateTimeType::DateTime32),
             ValueRef::Nullable(u) => match u {
                 Either::Left(sql_type) => SqlType::Nullable(sql_type),
@@ -288,6 +298,8 @@ impl<'a> From<ValueRef<'a>> for Value {
             ValueRef::Float32(v) => Value::Float32(v),
             ValueRef::Float64(v) => Value::Float64(v),
             ValueRef::Date(v) => Value::Date(v),
+            ValueRef::Date32(v) => Value::Date32(v),
+            ValueRef::Time64(v) => Value::Time64(v),
             ValueRef::DateTime(v, tz) => Value::DateTime(v, tz),
             ValueRef::Nullable(u) => match u {
                 Either::Left(sql_type) => Value::Nullable(Either::Left((sql_type.clone()).into())),
@@ -385,6 +397,8 @@ impl<'a> From<&'a Value> for ValueRef<'a> {
             Value::Float32(v) => ValueRef::Float32(*v),
             Value::Float64(v) => ValueRef::Float64(*v),
             Value::Date(v) => ValueRef::Date(*v),
+            Value::Date32(v) => ValueRef::Date32(*v),
+            Value::Time64(v) => ValueRef::Time64(*v),
             Value::DateTime(v, tz) => ValueRef::DateTime(*v, *tz),
             Value::DateTime64(v, params) => ValueRef::DateTime64(*v, params),
             Value::Nullable(u) => match u {
@@ -489,6 +503,8 @@ impl<'a> From<ValueRef<'a>> for AppDateTime {
 
 value_from! {
     bool: Bool,
+    Date32: Date32,
+    Time64: Time64,
 
     u8: UInt8,
     u16: UInt16,

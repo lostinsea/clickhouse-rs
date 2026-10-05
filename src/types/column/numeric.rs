@@ -3,7 +3,7 @@ use std::{mem, sync::Arc};
 
 use crate::{
     binary::{Encoder, ReadEx},
-    errors::Result,
+    errors::{DriverError, Error, Result},
     types::{
         column::{
             array::ArrayColumnData, nullable::NullableColumnData, ArcColumnWrapper, ColumnWrapper,
@@ -49,11 +49,9 @@ where
         + 'static,
 {
     fn column_from<W: ColumnWrapper>(source: Self) -> W::Wrapper {
-        let mut data = List::with_capacity(source.len());
-        for s in source {
-            data.push(s);
-        }
-        W::wrap(VectorColumnData { data })
+        W::wrap(VectorColumnData {
+            data: List::from_vec(source),
+        })
     }
 }
 
@@ -165,6 +163,30 @@ where
         unsafe {
             data.set_len(size);
         }
+        reader.read_bytes(data.as_mut())?;
+        Ok(Self { data })
+    }
+
+    pub(crate) fn load_checked<R: ReadEx>(
+        reader: &mut R,
+        size: usize,
+    ) -> Result<VectorColumnData<T>>
+    where
+        T: Default,
+    {
+        size.checked_mul(mem::size_of::<T>()).ok_or_else(|| {
+            Error::Driver(DriverError::Deserialize(
+                "LowCardinality key count exceeds platform byte capacity.".into(),
+            ))
+        })?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(size).map_err(|_| {
+            Error::Driver(DriverError::Deserialize(
+                "LowCardinality key allocation failed.".into(),
+            ))
+        })?;
+        values.resize(size, T::default());
+        let mut data = List::from_vec(values);
         reader.read_bytes(data.as_mut())?;
         Ok(Self { data })
     }

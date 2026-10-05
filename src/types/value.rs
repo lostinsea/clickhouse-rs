@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::types::{
     column::datetime64::{to_datetime, DEFAULT_TZ},
     decimal::{Decimal, NoBits},
-    DateConverter, DateTimeType, Enum16, Enum8, HasSqlType, SqlType,
+    Date32, DateConverter, DateTimeType, Enum16, Enum8, HasSqlType, SqlType, Time64,
 };
 
 pub(crate) type AppDateTime = DateTime<Tz>;
@@ -56,6 +56,8 @@ pub enum Value {
         &'static SqlType,
         Arc<HashMap<Value, Value>>,
     ),
+    Date32(Date32),
+    Time64(Time64),
 }
 
 impl Hash for Value {
@@ -73,6 +75,8 @@ impl Hash for Value {
             Self::UInt64(i) => i.hash(state),
             Self::UInt128(i) => i.hash(state),
             Self::Date(d) => d.hash(state),
+            Self::Date32(d) => d.hash(state),
+            Self::Time64(t) => t.hash(state),
             Self::DateTime(t, _) => t.hash(state),
             Self::DateTime64(t, (prec_a, _)) => (*t, *prec_a).hash(state),
             _ => unimplemented!(),
@@ -100,6 +104,8 @@ impl PartialEq for Value {
             (Value::Float32(a), Value::Float32(b)) => *a == *b,
             (Value::Float64(a), Value::Float64(b)) => *a == *b,
             (Value::Date(a), Value::Date(b)) => *a == *b,
+            (Value::Date32(a), Value::Date32(b)) => *a == *b,
+            (Value::Time64(a), Value::Time64(b)) => *a == *b,
             (Value::DateTime(a, tz_a), Value::DateTime(b, tz_b)) => {
                 let time_a = tz_a.timestamp_opt(i64::from(*a), 0).unwrap();
                 let time_b = tz_b.timestamp_opt(i64::from(*b), 0).unwrap();
@@ -149,6 +155,22 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    #[inline(always)]
+    pub(crate) fn contains_native_temporal(&self) -> bool {
+        match self {
+            Value::Date32(_) | Value::Time64(_) => true,
+            Value::Nullable(e) => match e {
+                Either::Left(inner) => inner.contains_native_temporal(),
+                Either::Right(value) => value.contains_native_temporal(),
+            },
+            Value::Array(inner, _) => inner.contains_native_temporal(),
+            Value::Map(key, value, _) => {
+                key.contains_native_temporal() || value.contains_native_temporal()
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn default(sql_type: SqlType) -> Value {
         match sql_type {
             SqlType::Bool => Value::Bool(false),
@@ -168,6 +190,8 @@ impl Value {
             SqlType::Float32 => Value::Float32(0.0),
             SqlType::Float64 => Value::Float64(0.0),
             SqlType::Date => 0_u16.to_date(*DEFAULT_TZ).into(),
+            SqlType::Date32 => Value::Date32(Date32::new(0)),
+            SqlType::Time64(precision) => Value::Time64(Time64::from_validated(0, precision)),
             SqlType::DateTime(DateTimeType::DateTime64(_, _)) => {
                 Value::DateTime64(0, (1, *DEFAULT_TZ))
             }
@@ -239,6 +263,8 @@ impl fmt::Display for Value {
                     .unwrap();
                 fmt::Display::fmt(&date.format("%Y-%m-%d"), f)
             }
+            Value::Date32(v) => fmt::Display::fmt(v, f),
+            Value::Time64(v) => fmt::Display::fmt(v, f),
             Value::Nullable(v) => match v {
                 Either::Left(_) => write!(f, "NULL"),
                 Either::Right(data) => data.fmt(f),
@@ -294,6 +320,8 @@ impl From<Value> for SqlType {
             Value::Float32(_) => SqlType::Float32,
             Value::Float64(_) => SqlType::Float64,
             Value::Date(_) => SqlType::Date,
+            Value::Date32(_) => SqlType::Date32,
+            Value::Time64(value) => SqlType::Time64(value.precision_type()),
             Value::DateTime(_, _) => SqlType::DateTime(DateTimeType::DateTime32),
             Value::ChronoDateTime(_) => SqlType::DateTime(DateTimeType::DateTime32),
             Value::Nullable(d) => match d {
@@ -339,6 +367,7 @@ macro_rules! value_from {
     ( $( $t:ty : $k:ident ),* ) => {
         $(
             impl convert::From<$t> for Value {
+                #[inline]
                 fn from(v: $t) -> Value {
                     Value::$k(v.into())
                 }
@@ -365,6 +394,36 @@ macro_rules! value_array_from {
 impl From<AppDate> for Value {
     fn from(v: AppDate) -> Value {
         Value::Date(u16::get_days(v))
+    }
+}
+
+impl From<Date32> for Value {
+    fn from(value: Date32) -> Self {
+        Self::Date32(value)
+    }
+}
+
+impl From<Vec<Date32>> for Value {
+    fn from(values: Vec<Date32>) -> Self {
+        Value::Array(
+            SqlType::Date32.into(),
+            Arc::new(values.into_iter().map(Value::from).collect()),
+        )
+    }
+}
+
+impl From<Vec<Option<Date32>>> for Value {
+    fn from(values: Vec<Option<Date32>>) -> Self {
+        Value::Array(
+            SqlType::Nullable(SqlType::Date32.into()).into(),
+            Arc::new(values.into_iter().map(Value::from).collect()),
+        )
+    }
+}
+
+impl From<Time64> for Value {
+    fn from(value: Time64) -> Self {
+        Self::Time64(value)
     }
 }
 
@@ -533,6 +592,7 @@ macro_rules! from_value {
     ( $( $t:ty : $k:ident ),* ) => {
         $(
             impl convert::From<Value> for $t {
+                #[inline]
                 fn from(v: Value) -> $t {
                     if let Value::$k(x) = v {
                         return x;
@@ -576,6 +636,8 @@ impl From<Value> for AppDateTime {
 
 from_value! {
     bool: Bool,
+    Date32: Date32,
+    Time64: Time64,
     u8: UInt8,
     u16: UInt16,
     u32: UInt32,

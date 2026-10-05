@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use crate::{
     binary::{Encoder, ReadEx},
-    errors::Result,
+    errors::{DriverError, Error, Result},
     types::{
         column::{
-            column_data::{ArcColumnData, BoxColumnData},
+            column_data::{ArcColumnData, BoxColumnData, LowCardinalityAccessor},
+            temporal::Time64ColumnData,
             ArcColumnWrapper, ColumnData,
         },
         SqlType, Value, ValueRef,
@@ -27,7 +28,18 @@ impl NullableColumnData {
         size: usize,
         tz: Tz,
     ) -> Result<Self> {
-        let mut nulls = vec![0; size];
+        let mut nulls = if type_name == "Date32" || type_name.starts_with("Time64(") {
+            let mut values = Vec::new();
+            values.try_reserve_exact(size).map_err(|_| {
+                Error::Driver(DriverError::Deserialize(
+                    "Nullable native temporal bitmap allocation failed.".into(),
+                ))
+            })?;
+            values.resize(size, 0);
+            values
+        } else {
+            vec![0; size]
+        };
         reader.read_bytes(nulls.as_mut())?;
         let inner =
             <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(reader, type_name, size, tz)?;
@@ -105,8 +117,32 @@ impl ColumnData for NullableColumnData {
         }
     }
 
+    unsafe fn get_internals(&self, data_ptr: *mut (), level: u8, props: u32) -> Result<()> {
+        self.inner.get_internals(data_ptr, level, props)
+    }
+
     fn cast_to(&self, _this: &ArcColumnData, target: &SqlType) -> Option<ArcColumnData> {
         if let SqlType::Nullable(inner_target) = target {
+            if let (SqlType::Time64(_), SqlType::Time64(precision)) =
+                (self.inner.sql_type(), *inner_target)
+            {
+                let mut coefficients = Vec::with_capacity(self.nulls.len());
+                for (index, null) in self.nulls.iter().enumerate() {
+                    if *null != 0 {
+                        coefficients.push(0);
+                    } else if let ValueRef::Time64(value) = self.inner.at(index) {
+                        coefficients.push(value.rescale(precision.get()).ok()?.coefficient());
+                    } else {
+                        return None;
+                    }
+                }
+                let inner =
+                    Time64ColumnData::from_coefficients(precision.get(), coefficients).ok()?;
+                return Some(Arc::new(NullableColumnData {
+                    inner: Arc::new(inner),
+                    nulls: self.nulls.clone(),
+                }));
+            }
             if let Some(inner) = self.inner.cast_to(&self.inner, inner_target) {
                 return Some(Arc::new(NullableColumnData {
                     inner,
@@ -119,5 +155,9 @@ impl ColumnData for NullableColumnData {
 
     fn get_timezone(&self) -> Option<Tz> {
         self.inner.get_timezone()
+    }
+
+    fn get_low_cardinality_accessor(&self) -> Option<&dyn LowCardinalityAccessor> {
+        self.inner.get_low_cardinality_accessor()
     }
 }

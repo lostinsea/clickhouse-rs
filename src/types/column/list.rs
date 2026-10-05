@@ -37,6 +37,10 @@ where
         }
     }
 
+    pub fn from_vec(data: Vec<T>) -> List<T> {
+        Self { data }
+    }
+
     pub fn resize(&mut self, new_len: usize, value: T) {
         self.data.resize(new_len, value);
     }

@@ -78,20 +78,29 @@ impl LowCardinalityIndex {
         reader: &mut R,
         size: usize,
         type_: IndexType,
+        native_temporal: bool,
     ) -> Result<LowCardinalityIndex> {
         Ok(match type_ {
-            IndexType::UInt8 => {
-                LowCardinalityIndex::UInt8(VectorColumnData::<u8>::load(reader, size)?)
-            }
-            IndexType::UInt16 => {
-                LowCardinalityIndex::UInt16(VectorColumnData::<u16>::load(reader, size)?)
-            }
-            IndexType::UInt32 => {
-                LowCardinalityIndex::UInt32(VectorColumnData::<u32>::load(reader, size)?)
-            }
-            IndexType::UInt64 => {
-                LowCardinalityIndex::UInt64(VectorColumnData::<u64>::load(reader, size)?)
-            }
+            IndexType::UInt8 => LowCardinalityIndex::UInt8(if native_temporal {
+                VectorColumnData::<u8>::load_checked(reader, size)?
+            } else {
+                VectorColumnData::<u8>::load(reader, size)?
+            }),
+            IndexType::UInt16 => LowCardinalityIndex::UInt16(if native_temporal {
+                VectorColumnData::<u16>::load_checked(reader, size)?
+            } else {
+                VectorColumnData::<u16>::load(reader, size)?
+            }),
+            IndexType::UInt32 => LowCardinalityIndex::UInt32(if native_temporal {
+                VectorColumnData::<u32>::load_checked(reader, size)?
+            } else {
+                VectorColumnData::<u32>::load(reader, size)?
+            }),
+            IndexType::UInt64 => LowCardinalityIndex::UInt64(if native_temporal {
+                VectorColumnData::<u64>::load_checked(reader, size)?
+            } else {
+                VectorColumnData::<u64>::load(reader, size)?
+            }),
         })
     }
 
@@ -111,6 +120,27 @@ impl LowCardinalityIndex {
             LowCardinalityIndex::UInt32(ix) => ix.get_by_index(index) as usize,
             LowCardinalityIndex::UInt64(ix) => ix.get_by_index(index) as usize,
         }
+    }
+
+    fn validate_indices(&self, dictionary_len: usize) -> Result<()> {
+        let invalid_index = || {
+            Error::Driver(DriverError::Deserialize(Cow::Borrowed(
+                "LowCardinality dictionary index is out of bounds.",
+            )))
+        };
+        for row in 0..self.len() {
+            let key = match self {
+                LowCardinalityIndex::UInt8(values) => u64::from(values.get_by_index(row)),
+                LowCardinalityIndex::UInt16(values) => u64::from(values.get_by_index(row)),
+                LowCardinalityIndex::UInt32(values) => u64::from(values.get_by_index(row)),
+                LowCardinalityIndex::UInt64(values) => values.get_by_index(row),
+            };
+            let index = usize::try_from(key).map_err(|_| invalid_index())?;
+            if index >= dictionary_len {
+                return Err(invalid_index());
+            }
+        }
+        Ok(())
     }
 
     fn max_len(&self) -> usize {
@@ -186,6 +216,37 @@ pub(crate) struct LowCardinalityColumnData {
 }
 
 impl LowCardinalityColumnData {
+    pub(crate) fn ensure_writable_type(sql_type: &SqlType) -> Result<()> {
+        match sql_type {
+            SqlType::LowCardinality(inner) => {
+                Self::ensure_writable(inner)?;
+                Self::ensure_writable_type(inner)
+            }
+            SqlType::Nullable(inner)
+            | SqlType::Array(inner)
+            | SqlType::SimpleAggregateFunction(_, inner) => Self::ensure_writable_type(inner),
+            SqlType::Map(key, value) => {
+                Self::ensure_writable_type(key)?;
+                Self::ensure_writable_type(value)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn ensure_writable(inner: &SqlType) -> Result<()> {
+        let mut value_type = inner;
+        while let SqlType::Nullable(nested) = value_type {
+            value_type = nested;
+        }
+        if matches!(value_type, SqlType::Time64(_)) {
+            return Err(Error::FromSql(FromSqlError::InvalidType {
+                src: format!("LowCardinality({inner})").into(),
+                dst: "a writable LowCardinality column in this client".into(),
+            }));
+        }
+        Ok(())
+    }
+
     pub(crate) fn load<R: ReadEx>(
         reader: &mut R,
         inner_type: &str,
@@ -205,6 +266,7 @@ impl LowCardinalityColumnData {
         timezone: Tz,
         capacity: usize,
     ) -> Result<LowCardinalityColumnData> {
+        Self::ensure_writable(inner)?;
         Ok(LowCardinalityColumnData {
             inner: <dyn ColumnData>::from_type::<ArcColumnWrapper>(
                 inner.clone(),
@@ -226,7 +288,7 @@ fn read_inner<R: ReadEx>(
     if size == 0 {
         let inner =
             <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(reader, inner_type, size, tz)?;
-        let keys = LowCardinalityIndex::load(reader, size, IndexType::UInt8)?;
+        let keys = LowCardinalityIndex::load(reader, size, IndexType::UInt8, false)?;
         return Ok((inner, keys));
     }
 
@@ -247,16 +309,43 @@ fn read_inner<R: ReadEx>(
     }
 
     let new_index_column: u64 = reader.read_scalar()?;
+    let dictionary_size = usize::try_from(new_index_column).map_err(|_| {
+        Error::Driver(DriverError::Deserialize(Cow::Borrowed(
+            "LowCardinality dictionary size exceeds platform capacity.",
+        )))
+    })?;
     let inner = <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(
         reader,
         inner_type,
-        new_index_column as usize,
+        dictionary_size,
         tz,
     )?;
 
     let keys_rows: u64 = reader.read_scalar()?;
-    let keys = LowCardinalityIndex::load(reader, keys_rows as usize, index_type)?;
-    assert_eq!(flags, keys.get_flags());
+    let key_count = usize::try_from(keys_rows).map_err(|_| {
+        Error::Driver(DriverError::Deserialize(Cow::Borrowed(
+            "LowCardinality key count exceeds platform capacity.",
+        )))
+    })?;
+    if inner.sql_type().contains_native_temporal() && key_count != size {
+        return Err(Error::Driver(DriverError::Deserialize(
+            format!("LowCardinality key count {key_count} does not match row count {size}.").into(),
+        )));
+    }
+    let keys = LowCardinalityIndex::load(
+        reader,
+        key_count,
+        index_type,
+        inner.sql_type().contains_native_temporal(),
+    )?;
+    if flags != keys.get_flags() {
+        return Err(Error::Driver(DriverError::Deserialize(Cow::Borrowed(
+            "Invalid LowCardinality index flags.",
+        ))));
+    }
+    if inner.sql_type().contains_native_temporal() {
+        keys.validate_indices(inner.len())?;
+    }
 
     Ok((inner, keys))
 }
@@ -343,6 +432,19 @@ impl ColumnData for LowCardinalityColumnData {
 
     fn get_timezone(&self) -> Option<Tz> {
         self.inner.get_timezone()
+    }
+
+    unsafe fn get_internal(
+        &self,
+        pointers: &[*mut *const u8],
+        level: u8,
+        props: u32,
+    ) -> Result<()> {
+        if level == 1 && matches!(self.inner.sql_type(), SqlType::Nullable(_)) {
+            self.inner.get_internal(pointers, level, props)
+        } else {
+            Err(Error::FromSql(FromSqlError::UnsupportedOperation))
+        }
     }
 
     unsafe fn get_internals(&self, data_ptr: *mut (), level: u8, props: u32) -> Result<()> {

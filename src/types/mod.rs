@@ -6,7 +6,10 @@ use hostname::get;
 
 use lazy_static::lazy_static;
 
-use crate::{errors::ServerError, types::column::datetime64::DEFAULT_TZ};
+use crate::{
+    errors::{Error, ServerError},
+    types::column::datetime64::DEFAULT_TZ,
+};
 
 pub use self::{
     block::{Block, RCons, RNil, Row, RowBuilder, Rows},
@@ -18,6 +21,7 @@ pub use self::{
     options::{SettingType, SettingValue},
     query::{Query, QueryParameterValue},
     query_result::QueryResult,
+    temporal::{Date32, Time64},
     value::Value,
     value_ref::ValueRef,
 };
@@ -50,6 +54,7 @@ pub(crate) mod query_result;
 mod decimal;
 mod enums;
 mod options;
+mod temporal;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub(crate) struct Progress {
@@ -220,6 +225,7 @@ has_sql_type! {
     f32: SqlType::Float32,
     f64: SqlType::Float64,
     NaiveDate: SqlType::Date,
+    Date32: SqlType::Date32,
     DateTime<Tz>: SqlType::DateTime(DateTimeType::DateTime32)
 }
 
@@ -309,6 +315,40 @@ impl FromStr for SimpleAggFunc {
     }
 }
 
+/// The validated decimal precision of a Time64 coefficient.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct Time64Precision(u8);
+
+impl Time64Precision {
+    pub fn new(precision: u8) -> crate::errors::Result<Self> {
+        Self::try_from(precision)
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for Time64Precision {
+    type Error = Error;
+
+    fn try_from(precision: u8) -> crate::errors::Result<Self> {
+        if precision > 9 {
+            return Err(Error::Other(
+                format!("Time64 precision {precision} is outside 0..=9").into(),
+            ));
+        }
+        Ok(Self(precision))
+    }
+}
+
+impl fmt::Display for Time64Precision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum SqlType {
     Bool,
@@ -339,11 +379,26 @@ pub enum SqlType {
     Enum16(Vec<(String, i16)>),
     SimpleAggregateFunction(SimpleAggFunc, &'static SqlType),
     Map(&'static SqlType, &'static SqlType),
+    Date32,
+    Time64(Time64Precision),
 }
 
 lazy_static! {
     static ref TYPES_CACHE: Mutex<HashMap<SqlType, Pin<Box<SqlType>>>> = Mutex::new(HashMap::new());
 }
+
+static TIME64_SQL_TYPES: [SqlType; 10] = [
+    SqlType::Time64(Time64Precision(0)),
+    SqlType::Time64(Time64Precision(1)),
+    SqlType::Time64(Time64Precision(2)),
+    SqlType::Time64(Time64Precision(3)),
+    SqlType::Time64(Time64Precision(4)),
+    SqlType::Time64(Time64Precision(5)),
+    SqlType::Time64(Time64Precision(6)),
+    SqlType::Time64(Time64Precision(7)),
+    SqlType::Time64(Time64Precision(8)),
+    SqlType::Time64(Time64Precision(9)),
+];
 
 impl From<SqlType> for &'static SqlType {
     fn from(value: SqlType) -> Self {
@@ -360,6 +415,8 @@ impl From<SqlType> for &'static SqlType {
             SqlType::Float32 => &SqlType::Float32,
             SqlType::Float64 => &SqlType::Float64,
             SqlType::Date => &SqlType::Date,
+            SqlType::Date32 => &SqlType::Date32,
+            SqlType::Time64(precision) => &TIME64_SQL_TYPES[usize::from(precision.get())],
             _ => {
                 let mut guard = TYPES_CACHE.lock().unwrap();
                 loop {
@@ -374,6 +431,25 @@ impl From<SqlType> for &'static SqlType {
 }
 
 impl SqlType {
+    pub fn time64(precision: u8) -> crate::errors::Result<Self> {
+        Time64Precision::new(precision).map(Self::Time64)
+    }
+
+    #[inline]
+    pub(crate) fn contains_native_temporal(&self) -> bool {
+        match self {
+            SqlType::Date32 | SqlType::Time64(_) => true,
+            SqlType::Nullable(inner)
+            | SqlType::Array(inner)
+            | SqlType::LowCardinality(inner)
+            | SqlType::SimpleAggregateFunction(_, inner) => inner.contains_native_temporal(),
+            SqlType::Map(key, value) => {
+                key.contains_native_temporal() || value.contains_native_temporal()
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_datetime(&self) -> bool {
         matches!(self, SqlType::DateTime(_))
     }
@@ -384,7 +460,9 @@ impl SqlType {
             SqlType::String
                 | SqlType::FixedString(_)
                 | SqlType::Date
+                | SqlType::Date32
                 | SqlType::DateTime(_)
+                | SqlType::Time64(_)
                 | SqlType::UInt8
                 | SqlType::UInt16
                 | SqlType::UInt32
@@ -415,6 +493,8 @@ impl SqlType {
             SqlType::Float32 => "Float32".into(),
             SqlType::Float64 => "Float64".into(),
             SqlType::Date => "Date".into(),
+            SqlType::Date32 => "Date32".into(),
+            SqlType::Time64(precision) => format!("Time64({precision})").into(),
             SqlType::DateTime(DateTimeType::DateTime64(precision, tz)) => {
                 format!("DateTime64({precision}, '{tz:?}')").into()
             }

@@ -18,17 +18,52 @@ clickhouse-rs = "*"
 ## Supported data types
 
 * Date
+* Date32 (signed 32-bit days since 1970-01-01)
 * DateTime
+* Time64(P) (signed 64-bit coefficients, precision 0-9; no timezone or 24-hour limit)
 * Decimal(P, S)
 * Float32, Float64
 * String, FixedString(N)
 * UInt8, UInt16, UInt32, UInt64, UInt128, Int8, Int16, Int32, Int64, Int128
 * Nullable(T)
-* Array(UInt/Int/Float/String/Date/DateTime)
+* Array(UInt/Int/Float/String/Date/DateTime/Date32/Time64)
 * SimpleAggregateFunction(F, T)
 * IPv4/IPv6
 * UUID
 * Bool
+
+`Date32` and `Time64` retain their native signed values. Use
+`clickhouse_rs::types::{Date32, Time64}` with `Block::get` or `Row::get`.
+`Date32::to_naive_date()` returns an error when a native day is outside
+chrono's range. `Time64::new(coefficient, precision)` validates precision,
+and `Time64::rescale(precision)` accepts exact conversions while rejecting
+loss or overflow. `SqlType::time64(precision)` constructs a validated type;
+`SqlType::Time64` carries a `Time64Precision` rather than an unchecked `u8`.
+Time64 equality and hashing compare the raw coefficient **and** precision:
+equivalent durations at different precisions are distinct values. For
+inserts, `Block::column("date", Vec<Date32>)` creates
+a Date32 column; `Block::try_time64_column("time", precision, coefficients)`
+creates a Time64 column, including an empty column with an explicit
+precision. `Block::try_time64_values_column("time", precision, values)`
+accepts `Vec<Time64>` at mixed source precisions when every coefficient
+rescales exactly to the explicit target precision. When `Block::push` infers
+a Time64 column from the first row, that row's precision becomes the target;
+later rows must rescale exactly without overflow. Coefficients, including
+those returned by
+`Time64::coefficient()`, are in units of `10^-precision` seconds, not
+nanoseconds or wall-clock
+timestamps. Nullable and array values can be supplied through the existing
+`Value::Nullable` and `Value::Array` row APIs with explicit `SqlType` metadata
+where the server accepts the schema. All-null and empty Time64 containers
+need an explicit precision; there is no implicit precision for
+`Option<Time64>` or `Vec<Time64>`.
+ClickHouse 26.5 accepts `LowCardinality(Date32)` with
+`allow_suspicious_low_cardinality_types=1`, but rejects
+`LowCardinality(Time64(P))` and `LowCardinality(Nullable(Time64(P)))`
+with server error 43 even with that setting.
+The client reports a type error when explicitly constructing or inserting a
+column of either type; its generic reader is not restricted by this write
+policy.
 
 ## DNS
 

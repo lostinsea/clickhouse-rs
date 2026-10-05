@@ -19,10 +19,11 @@ use crate::{
             date::DateTimeInternals,
             datetime64::{to_datetime, to_native_datetime_opt},
             low_cardinality::{LowCardinalityIndex, LowCardinalityInternals},
+            temporal::TemporalInternals,
             StringPool,
         },
         decimal::NoBits,
-        Column, ColumnType, Complex, Decimal, Simple, SqlType,
+        Column, ColumnType, Complex, Date32, Decimal, Simple, SqlType, Time64, Time64Precision,
     },
 };
 
@@ -190,6 +191,23 @@ pub struct DateIterator<'a> {
     _marker: marker::PhantomData<&'a ()>,
 }
 
+pub struct Date32Iterator<'a> {
+    lc_index: Option<*const LowCardinalityIndex>,
+    ptr: *const i32,
+    index: usize,
+    len: usize,
+    _marker: marker::PhantomData<&'a ()>,
+}
+
+pub struct Time64Iterator<'a> {
+    lc_index: Option<*const LowCardinalityIndex>,
+    ptr: *const i64,
+    precision: Time64Precision,
+    index: usize,
+    len: usize,
+    _marker: marker::PhantomData<&'a ()>,
+}
+
 enum DateTimeInnerIterator {
     DateTime32(*const u32),
     DateTime64(*const i64, u32),
@@ -215,7 +233,9 @@ pub struct NativeDateTimeIterator<'a> {
 pub struct NullableIterator<'a, I> {
     inner: I,
     ptr: *const u8,
-    end: *const u8,
+    lc_index: Option<*const LowCardinalityIndex>,
+    index: usize,
+    len: usize,
     _marker: marker::PhantomData<&'a ()>,
 }
 
@@ -670,8 +690,7 @@ where
 {
     #[inline(always)]
     fn len(&self) -> usize {
-        let start = self.ptr;
-        self.end as usize - start as usize
+        self.len - self.index
     }
 }
 
@@ -682,14 +701,18 @@ where
     type Item = Option<I::Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.ptr == self.end {
+        if self.index == self.len {
             return None;
         }
 
         let value = self.inner.next()?;
         unsafe {
-            let flag = *self.ptr;
-            self.ptr = self.ptr.offset(1);
+            let index = self
+                .lc_index
+                .map(|ix| (*ix).get_by_index(self.index))
+                .unwrap_or(self.index);
+            let flag = *self.ptr.add(index);
+            self.index += 1;
 
             Some(if flag != 0 { None } else { Some(value) })
         }
@@ -1143,6 +1166,164 @@ fn cast_datetime_error(sql_type: SqlType) -> Error {
     })
 }
 
+fn temporal_iter<K: ColumnType>(
+    column: &Column<K>,
+    low_cardinality: bool,
+    props: u32,
+) -> Result<(*const (), usize, Option<*const LowCardinalityIndex>)> {
+    if low_cardinality {
+        let mut dictionary = TemporalInternals::default();
+        let mut lc = LowCardinalityInternals::default();
+        unsafe {
+            column.get_internals(&mut lc, 1, props)?;
+            column.get_internals(&mut dictionary, 0, props)?;
+            Ok((dictionary.begin, (*lc.index).len(), Some(lc.index)))
+        }
+    } else {
+        let mut begin: *const u8 = ptr::null();
+        let mut len: usize = 0;
+        unsafe {
+            column.get_internal(
+                &[&mut begin, &mut len as *mut usize as *mut *const u8],
+                0,
+                props,
+            )?;
+        }
+        Ok((begin.cast(), len, None))
+    }
+}
+
+impl<'a> Iterable<'a, Simple> for Date32 {
+    type Iter = Date32Iterator<'a>;
+
+    fn iter_with_props(
+        column: &'a Column<Simple>,
+        column_type: SqlType,
+        props: u32,
+    ) -> Result<Self::Iter> {
+        let low_cardinality = match column_type {
+            SqlType::Date32 => false,
+            SqlType::LowCardinality(SqlType::Date32) => true,
+            _ => {
+                return Err(Error::FromSql(FromSqlError::InvalidType {
+                    src: column_type.to_string(),
+                    dst: SqlType::Date32.to_string(),
+                }));
+            }
+        };
+        let (ptr, len, lc_index) = temporal_iter(column, low_cardinality, props)?;
+        Ok(Date32Iterator {
+            lc_index,
+            ptr: ptr.cast(),
+            index: 0,
+            len,
+            _marker: marker::PhantomData,
+        })
+    }
+}
+
+impl<'a> Iterable<'a, Simple> for Time64 {
+    type Iter = Time64Iterator<'a>;
+
+    fn iter_with_props(
+        column: &'a Column<Simple>,
+        column_type: SqlType,
+        props: u32,
+    ) -> Result<Self::Iter> {
+        let (precision, low_cardinality) = match column_type {
+            SqlType::Time64(precision) => (precision, false),
+            SqlType::LowCardinality(SqlType::Time64(precision)) => (*precision, true),
+            _ => {
+                return Err(Error::FromSql(FromSqlError::InvalidType {
+                    src: column_type.to_string(),
+                    dst: "Time64".into(),
+                }));
+            }
+        };
+        let (ptr, len, lc_index) = temporal_iter(column, low_cardinality, props)?;
+        Ok(Time64Iterator {
+            lc_index,
+            ptr: ptr.cast(),
+            precision,
+            index: 0,
+            len,
+            _marker: marker::PhantomData,
+        })
+    }
+}
+
+impl Date32Iterator<'_> {
+    unsafe fn next_unchecked(&mut self) -> Date32 {
+        let index = self
+            .lc_index
+            .map(|ix| (*ix).get_by_index(self.index))
+            .unwrap_or(self.index);
+        self.index += 1;
+        Date32::new(*self.ptr.add(index))
+    }
+}
+
+impl Iterator for Date32Iterator<'_> {
+    type Item = Date32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.len {
+            None
+        } else {
+            Some(unsafe { self.next_unchecked() })
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for Date32Iterator<'_> {
+    fn len(&self) -> usize {
+        self.len - self.index
+    }
+}
+
+impl FusedIterator for Date32Iterator<'_> {}
+
+impl Time64Iterator<'_> {
+    unsafe fn next_unchecked(&mut self) -> Time64 {
+        let index = self
+            .lc_index
+            .map(|ix| (*ix).get_by_index(self.index))
+            .unwrap_or(self.index);
+        self.index += 1;
+        Time64::from_validated(*self.ptr.add(index), self.precision)
+    }
+}
+
+impl Iterator for Time64Iterator<'_> {
+    type Item = Time64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.len {
+            None
+        } else {
+            Some(unsafe { self.next_unchecked() })
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for Time64Iterator<'_> {
+    fn len(&self) -> usize {
+        self.len - self.index
+    }
+}
+
+impl FusedIterator for Time64Iterator<'_> {}
+
 impl<'a> Iterable<'a, Simple> for NaiveDate {
     type Iter = DateIterator<'a>;
 
@@ -1207,32 +1388,52 @@ where
         column_type: SqlType,
         props: u32,
     ) -> Result<Self::Iter> {
-        let inner = if let SqlType::Nullable(inner_type) = column_type {
-            T::iter(column, inner_type.clone())?
-        } else {
-            return Err(Error::FromSql(FromSqlError::InvalidType {
-                src: column_type.to_string(),
-                dst: "Nullable".into(),
-            }));
+        let (inner, lc_index) = match &column_type {
+            SqlType::Nullable(inner_type) => (
+                T::iter_with_props(column, (**inner_type).clone(), props)?,
+                None,
+            ),
+            SqlType::LowCardinality(inner_type) if matches!(**inner_type, SqlType::Nullable(native) if native.contains_native_temporal()) =>
+            {
+                let SqlType::Nullable(native) = **inner_type else {
+                    unreachable!()
+                };
+                let inner = T::iter_with_props(column, SqlType::LowCardinality(native), props)?;
+                let mut lc = LowCardinalityInternals::default();
+                unsafe { column.get_internals(&mut lc, 1, props)? };
+                (inner, Some(lc.index))
+            }
+            _ => {
+                return Err(Error::FromSql(FromSqlError::InvalidType {
+                    src: column_type.to_string(),
+                    dst: "Nullable".into(),
+                }));
+            }
         };
 
-        let (ptr, end) = unsafe {
+        let (ptr, len) = unsafe {
             let mut ptr: *const u8 = ptr::null();
             let mut size: usize = 0;
+            let level = if lc_index.is_some() {
+                1
+            } else {
+                column_type.level()
+            };
             column.get_internal(
                 &[&mut ptr, &mut size as *mut usize as *mut *const u8],
-                column_type.level(),
+                level,
                 props,
             )?;
             assert_ne!(ptr, ptr::null());
-            let end = ptr.add(size);
-            (ptr, end)
+            (ptr, lc_index.map(|index| (*index).len()).unwrap_or(size))
         };
 
         Ok(NullableIterator {
             inner,
             ptr,
-            end,
+            lc_index,
+            index: 0,
+            len,
             _marker: marker::PhantomData,
         })
     }

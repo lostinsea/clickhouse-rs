@@ -50,10 +50,12 @@ pub trait ColumnData {
     }
 }
 
+#[cfg(test)]
 pub(crate) trait ColumnDataExt {
     fn append<T: Into<Value>>(&mut self, value: T);
 }
 
+#[cfg(test)]
 impl<C: ColumnData> ColumnDataExt for C {
     fn append<T: Into<Value>>(&mut self, value: T) {
         self.push(value.into());

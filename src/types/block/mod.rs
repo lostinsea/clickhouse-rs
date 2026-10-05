@@ -1,5 +1,6 @@
 use std::{
     cmp,
+    collections::HashSet,
     default::Default,
     fmt,
     io::{Cursor, Read},
@@ -14,10 +15,10 @@ use lz4::liblz4::{LZ4_compressBound, LZ4_compress_default};
 
 use crate::{
     binary::{protocol, Encoder, ReadEx},
-    errors::{Error, FromSqlError, Result},
+    errors::{DriverError, Error, FromSqlError, Result},
     types::{
         column::{self, ArcColumnWrapper, Column, ColumnFrom},
-        ColumnType, Complex, FromSql, Simple,
+        ColumnType, Complex, FromSql, Simple, Time64,
     },
 };
 
@@ -81,6 +82,14 @@ pub struct Block<K: ColumnType = Simple> {
     info: BlockInfo,
     columns: Vec<Column<K>>,
     capacity: usize,
+    has_native_temporal: bool,
+    has_duplicate_names: Option<bool>,
+    next_column_hint: usize,
+}
+
+fn has_duplicate_names<K: ColumnType>(columns: &[Column<K>]) -> bool {
+    let mut names = HashSet::with_capacity(columns.len());
+    columns.iter().any(|column| !names.insert(column.name()))
 }
 
 impl<L: ColumnType, R: ColumnType> PartialEq<Block<R>> for Block<L> {
@@ -105,6 +114,9 @@ impl<K: ColumnType> Clone for Block<K> {
             info: self.info,
             columns: self.columns.iter().map(|c| (*c).clone()).collect(),
             capacity: self.capacity,
+            has_native_temporal: self.has_native_temporal,
+            has_duplicate_names: self.has_duplicate_names,
+            next_column_hint: 0,
         }
     }
 }
@@ -153,6 +165,9 @@ impl Block {
             info: Default::default(),
             columns: vec![],
             capacity,
+            has_native_temporal: false,
+            has_duplicate_names: Some(false),
+            next_column_hint: 0,
         }
     }
 
@@ -181,10 +196,14 @@ impl Block {
         block.info = BlockInfo::read(reader)?;
 
         let num_columns = reader.read_uvarint()?;
-        let num_rows = reader.read_uvarint()?;
+        let num_rows = usize::try_from(reader.read_uvarint()?).map_err(|_| {
+            Error::Driver(DriverError::Deserialize(
+                "Block row count exceeds platform capacity.".into(),
+            ))
+        })?;
 
         for _ in 0..num_columns {
-            let column = Column::read(reader, num_rows as usize, tz, server_revision)?;
+            let column = Column::read(reader, num_rows, tz, server_revision)?;
             block.append_column(column);
         }
 
@@ -219,7 +238,17 @@ impl<K: ColumnType> Block<K> {
             panic!("all columns in block must have same size.")
         }
 
+        self.has_native_temporal |= column.sql_type().contains_native_temporal();
+        if !self.columns.is_empty() && self.has_duplicate_names != Some(true) {
+            self.has_duplicate_names = None;
+        }
         self.columns.push(column);
+    }
+
+    fn ensure_duplicate_names(&mut self) {
+        if self.has_duplicate_names.is_none() {
+            self.has_duplicate_names = Some(has_duplicate_names(&self.columns));
+        }
     }
 
     /// Get the value of a particular cell of the block.
@@ -252,6 +281,45 @@ impl<K: ColumnType> Block<K> {
         self
     }
 
+    /// Adds a Time64 column of raw signed coefficients at the specified decimal precision.
+    pub fn try_time64_column(
+        mut self,
+        name: &str,
+        precision: u8,
+        coefficients: Vec<i64>,
+    ) -> Result<Self> {
+        use column::{temporal::Time64ColumnData, ColumnData};
+
+        let data = Time64ColumnData::from_coefficients(precision, coefficients)?;
+        if !self.columns.is_empty() && self.row_count() != data.len() {
+            return Err(Error::Other(
+                format!(
+                    "Time64 column \"{name}\" expects {} rows, got {}.",
+                    self.row_count(),
+                    data.len()
+                )
+                .into(),
+            ));
+        }
+        self.append_column(column::new_column(name, std::sync::Arc::new(data)));
+        Ok(self)
+    }
+
+    /// Adds Time64 values at an explicit target precision, accepting only exact rescaling.
+    pub fn try_time64_values_column(
+        self,
+        name: &str,
+        precision: u8,
+        values: Vec<Time64>,
+    ) -> Result<Self> {
+        Time64::new(0, precision)?;
+        let coefficients = values
+            .into_iter()
+            .map(|value| value.rescale(precision).map(Time64::coefficient))
+            .collect::<Result<Vec<_>>>()?;
+        self.try_time64_column(name, precision, coefficients)
+    }
+
     /// Returns true if the block contains no elements.
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
@@ -267,8 +335,12 @@ impl<K: ColumnType> Block<K> {
     }
 
     /// This method is a convenient way to pass row into a block.
+    #[inline(always)]
     pub fn push<B: RowBuilder>(&mut self, row: B) -> Result<()> {
-        row.apply(self)
+        if self.has_native_temporal || row.contains_native_temporal() {
+            row.validate_native_temporal(self)?;
+        }
+        builder::apply_validated(row, self)
     }
 
     /// This method finds a column by identifier.
@@ -301,10 +373,16 @@ impl Block<Simple> {
             columns.push(Column::concat(chunks));
         }
 
+        let has_native_temporal = columns
+            .iter()
+            .any(|column| column.sql_type().contains_native_temporal());
         Block {
             info: first.info,
             columns,
             capacity: blocks.iter().map(|b| b.capacity).sum(),
+            has_native_temporal,
+            has_duplicate_names: None,
+            next_column_hint: 0,
         }
     }
 }
@@ -327,10 +405,16 @@ impl<K: ColumnType> Block<K> {
             new_columns.push(new_column);
         }
 
+        let has_native_temporal = new_columns
+            .iter()
+            .any(|column| column.sql_type().contains_native_temporal());
         Ok(Block {
             info,
             columns: new_columns,
             capacity: self.capacity,
+            has_native_temporal,
+            has_duplicate_names: None,
+            next_column_hint: 0,
         })
     }
 
