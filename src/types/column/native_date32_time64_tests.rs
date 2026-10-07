@@ -1,8 +1,9 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
     hint::black_box,
     io::Cursor,
+    sync::Arc,
     time::Instant,
 };
 
@@ -18,11 +19,12 @@ use crate::{
         column::{
             column_data::{ArcColumnData, ColumnData},
             new_column,
+            simple_agg_func::SimpleAggregateFunctionColumnData,
             temporal::{Date32ColumnData, Time64ColumnData},
             ArcColumnWrapper,
         },
-        Date32, FromSql, Marshal, RNil, RowBuilder, Simple, SqlType, StatBuffer, Time64,
-        Time64Precision, Value, ValueRef,
+        Date32, FromSql, Marshal, RNil, RowBuilder, Simple, SimpleAggFunc, SqlType, StatBuffer,
+        Time64, Time64Precision, Value, ValueRef,
     },
     Block,
 };
@@ -1125,5 +1127,631 @@ fn native_date32_time64_release_codec_benchmark() {
         median(&mut date32_decode).as_nanos(),
         median(&mut time64_encode).as_nanos(),
         median(&mut time64_decode).as_nanos()
+    );
+}
+
+#[test]
+fn native_date32_time64_wrapped_date32_wire_column_iterates_like_scalar_access() {
+    let expected = vec![date32(-10_957), date32(0), date32(19_723)];
+
+    for (type_name, func) in [
+        ("SimpleAggregateFunction(any, Date32)", SimpleAggFunc::Any),
+        (
+            "SimpleAggregateFunction(anyLast, Date32)",
+            SimpleAggFunc::AnyLast,
+        ),
+    ] {
+        let mut encoder = Encoder::new();
+        for value in &expected {
+            encoder.write(value.days());
+        }
+        let wrapped = load_column(type_name, encoder.get_buffer(), expected.len())
+            .unwrap_or_else(|error| panic!("{type_name} must load from the wire: {error}"));
+        assert_eq!(
+            wrapped.sql_type(),
+            SqlType::SimpleAggregateFunction(func, SqlType::Date32.into())
+        );
+
+        let column = new_column::<Simple>("date", wrapped);
+        let scalar = (0..expected.len())
+            .map(|index| Date32::from_sql(column.at(index)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(scalar, expected, "{type_name} scalar access");
+
+        let iterated = column
+            .iter::<Date32>()
+            .map(|values| values.collect::<Vec<_>>())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{type_name} loaded and read back {scalar:?} through scalar access, but \
+                     typed iteration was refused with: {error}"
+                )
+            });
+        assert_eq!(iterated, expected, "{type_name} typed iteration");
+    }
+}
+
+// Negative control for the forthcoming temporal iterator fix. It deliberately
+// shares no state with the baseline-failing wrapper iteration test above, so it
+// passes on the untouched baseline and keeps reporting on the dictionary shapes
+// even while the wrapper iteration test is still red.
+#[test]
+fn native_date32_time64_low_cardinality_simple_agg_chains_reject_date32_iteration() {
+    fn dictionary_payload() -> Vec<u8> {
+        const UINT8_FLAGS: u64 = (1 << 9) | (1 << 10);
+
+        low_cardinality_payload(UINT8_FLAGS, -10_957_i32, 1, 0)
+    }
+
+    // Baseline: a direct dictionary of Date32 iterates today, and the wrapper
+    // fix must not disturb it.
+    let direct = new_column::<Simple>(
+        "date",
+        load_column("LowCardinality(Date32)", dictionary_payload(), 1)
+            .expect("LowCardinality(Date32) must load from the wire"),
+    );
+    assert_eq!(
+        direct.sql_type(),
+        SqlType::LowCardinality(SqlType::Date32.into())
+    );
+    assert_eq!(Date32::from_sql(direct.at(0)).unwrap(), date32(-10_957));
+    assert_eq!(
+        direct.iter::<Date32>().unwrap().collect::<Vec<_>>(),
+        vec![date32(-10_957)],
+        "LowCardinality(Date32) typed iteration"
+    );
+
+    // The wrapper forwards `get_internal` but not `get_internals`, and a
+    // dictionary needs `get_internals`. Only a SimpleAggregateFunction chain
+    // terminating in a direct native scalar leaf may become iterable, so both
+    // orderings of a wrapper and a dictionary must keep failing with
+    // `InvalidType` naming the full source type, never with the
+    // `UnsupportedOperation` that `temporal_iter` would raise and never with a
+    // success.
+    //
+    // `SimpleAggregateFunction(any, LowCardinality(Date32))` cannot be loaded
+    // from the wire on this baseline because `parse_simple_agg_fun` strips the
+    // inner closing parenthesis, so it is assembled directly instead.
+    let wrapper_over_dictionary: ArcColumnData = Arc::new(SimpleAggregateFunctionColumnData {
+        inner: load_column("LowCardinality(Date32)", dictionary_payload(), 1)
+            .expect("LowCardinality(Date32) must load from the wire"),
+        func: SimpleAggFunc::Any,
+    });
+    let dictionary_over_wrapper = load_column(
+        "LowCardinality(SimpleAggregateFunction(any, Date32))",
+        dictionary_payload(),
+        1,
+    )
+    .expect("LowCardinality(SimpleAggregateFunction(any, Date32)) must load from the wire");
+
+    for (expected_src, data) in [
+        (
+            "SimpleAggregateFunction(any, LowCardinality(Date32))",
+            wrapper_over_dictionary,
+        ),
+        (
+            "LowCardinality(SimpleAggregateFunction(any, Date32))",
+            dictionary_over_wrapper,
+        ),
+    ] {
+        let column = new_column::<Simple>("date", data);
+        assert_eq!(
+            column.sql_type().to_string(),
+            expected_src,
+            "the assembled column must declare the source type this control pins"
+        );
+        assert_eq!(
+            Date32::from_sql(column.at(0)).unwrap(),
+            date32(-10_957),
+            "{expected_src} scalar access"
+        );
+
+        let error = column
+            .iter::<Date32>()
+            .err()
+            .unwrap_or_else(|| panic!("{expected_src} typed Date32 iteration must stay rejected"));
+        match error {
+            Error::FromSql(FromSqlError::InvalidType { src, dst }) => {
+                assert_eq!(src, expected_src, "rejected source type spelling");
+                assert_eq!(dst, "Date32", "{expected_src} rejected target type");
+            }
+            other => panic!("{expected_src}: expected a typed InvalidType rejection, got {other}"),
+        }
+    }
+}
+
+#[test]
+fn native_date32_time64_wrapped_time64_memory_column_iterates_with_declared_precision() {
+    let wrapper_type =
+        SqlType::SimpleAggregateFunction(SimpleAggFunc::AnyLast, sql_time64(6).into());
+    let data = <dyn ColumnData>::from_type::<ArcColumnWrapper>(wrapper_type.clone(), Tz::UTC, 4)
+        .expect("in-memory SimpleAggregateFunction(anyLast, Time64(6)) must be constructible");
+    let mut column = new_column::<Simple>("clock", data);
+    assert_eq!(column.sql_type(), wrapper_type);
+
+    for value in [
+        time64(-1, 6),
+        time64(0, 6),
+        time64(86_399_999_999, 6),
+        time64(1, 0),
+    ] {
+        column.push(Value::Time64(value));
+    }
+
+    let expected = vec![
+        time64(-1, 6),
+        time64(0, 6),
+        time64(86_399_999_999, 6),
+        time64(1_000_000, 6),
+    ];
+    let scalar = (0..expected.len())
+        .map(|index| Time64::from_sql(column.at(index)).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(scalar, expected, "wrapped Time64 scalar access");
+
+    let iterated = column
+        .iter::<Time64>()
+        .map(|values| values.collect::<Vec<_>>())
+        .unwrap_or_else(|error| {
+            panic!(
+                "SimpleAggregateFunction(anyLast, Time64(6)) was constructed in memory and read \
+                 back {scalar:?} through scalar access, but typed iteration was refused with: \
+                 {error}"
+            )
+        });
+    assert_eq!(iterated, expected, "wrapped Time64 typed iteration");
+    assert!(
+        iterated.iter().all(|value| value.precision() == 6),
+        "typed iteration must carry the declared precision 6, got {iterated:?}"
+    );
+
+    let wrapped_low_cardinality = SqlType::SimpleAggregateFunction(
+        SimpleAggFunc::AnyLast,
+        SqlType::LowCardinality(sql_time64(6).into()).into(),
+    );
+    let error =
+        <dyn ColumnData>::from_type::<ArcColumnWrapper>(wrapped_low_cardinality, Tz::UTC, 0)
+            .err()
+            .expect("a writable LowCardinality(Time64) under the wrapper must stay rejected");
+    assert!(matches!(
+        error,
+        Error::FromSql(FromSqlError::InvalidType { .. })
+    ));
+}
+
+// A rejected push must leave the block exactly as it was, and a length check
+// alone would pass even if an already-present ordinary or map value had been
+// overwritten in place. Cloning the block to snapshot it is not an option:
+// `Block`/`Column`/`MapColumnData` clones only bump the `ArcColumnData`
+// refcounts, so a live clone turns the very next accepted map push into an
+// `Arc::get_mut(...).unwrap()` panic inside `MapColumnData::push`. `snapshot`
+// therefore reads every cell into owned plain data and keeps no column handle.
+#[derive(Debug, PartialEq)]
+enum Cell {
+    Scalar(String),
+    MapUInt8(Vec<(i64, u8, u8)>),
+    MapTime64(Vec<(i64, u8, i64, u8)>),
+    Unreadable(String),
+}
+
+#[derive(Debug, PartialEq)]
+struct ColumnSnapshot {
+    name: String,
+    sql_type: SqlType,
+    len: usize,
+    cells: Vec<Cell>,
+}
+
+fn snapshot(block: &Block<Simple>) -> Vec<ColumnSnapshot> {
+    let mut columns = Vec::with_capacity(block.column_count());
+    for column in block.columns() {
+        let is_map = matches!(column.sql_type(), SqlType::Map(..));
+        let mut cells = Vec::with_capacity(column.len());
+        for row in 0..column.len() {
+            if !is_map {
+                cells.push(Cell::Scalar(format!("{:?}", column.at(row))));
+                continue;
+            }
+            match <HashMap<Time64, u8>>::from_sql(column.at(row)) {
+                Ok(entries) => {
+                    let mut entries: Vec<(i64, u8, u8)> = entries
+                        .into_iter()
+                        .map(|(key, value)| (key.coefficient(), key.precision(), value))
+                        .collect();
+                    entries.sort_unstable();
+                    cells.push(Cell::MapUInt8(entries));
+                }
+                Err(uint8_error) => match <HashMap<Time64, Time64>>::from_sql(column.at(row)) {
+                    Ok(entries) => {
+                        let mut entries: Vec<(i64, u8, i64, u8)> = entries
+                            .into_iter()
+                            .map(|(key, value)| {
+                                (
+                                    key.coefficient(),
+                                    key.precision(),
+                                    value.coefficient(),
+                                    value.precision(),
+                                )
+                            })
+                            .collect();
+                        entries.sort_unstable();
+                        cells.push(Cell::MapTime64(entries));
+                    }
+                    Err(_) => cells.push(Cell::Unreadable(uint8_error.to_string())),
+                },
+            }
+        }
+        columns.push(ColumnSnapshot {
+            name: column.name().to_string(),
+            sql_type: column.sql_type(),
+            len: column.len(),
+            cells,
+        });
+    }
+    columns
+}
+
+fn shape(columns: &[ColumnSnapshot]) -> Vec<(&str, &SqlType, usize)> {
+    columns
+        .iter()
+        .map(|column| (column.name.as_str(), &column.sql_type, column.len))
+        .collect()
+}
+
+fn assert_unmutated(block: &Block<Simple>, before: &[ColumnSnapshot], case: &str) {
+    let after = snapshot(block);
+    assert_eq!(
+        block.column_count(),
+        before.len(),
+        "{case}: the rejected push changed the column count"
+    );
+    assert_eq!(
+        block.row_count(),
+        before.first().map_or(0, |column| column.len),
+        "{case}: the rejected push changed the row count"
+    );
+    assert_eq!(
+        shape(&after),
+        shape(before),
+        "{case}: the rejected push changed the column names, types or lengths"
+    );
+    for (after_column, before_column) in after.iter().zip(before) {
+        assert_eq!(
+            after_column.cells, before_column.cells,
+            "{case}: the rejected push mutated values in column `{}`",
+            before_column.name
+        );
+    }
+    assert_eq!(
+        after.as_slice(),
+        before,
+        "{case}: the rejected push mutated existing ordinary or map column values"
+    );
+}
+
+#[test]
+fn native_date32_time64_wrapped_time64_map_keys_reject_normalized_collisions() {
+    fn map_value(key_type: &SqlType, entries: &[(Time64, u8)]) -> Value {
+        let mut map = HashMap::with_capacity(entries.len());
+        for (key, value) in entries {
+            map.insert(Value::Time64(*key), Value::UInt8(*value));
+        }
+        assert_eq!(
+            map.len(),
+            entries.len(),
+            "the source keys must be distinct before any client-side normalization"
+        );
+        Value::Map(
+            key_type.clone().into(),
+            SqlType::UInt8.into(),
+            Arc::new(map),
+        )
+    }
+
+    fn seeded_block(key_type: &SqlType) -> Block<Simple> {
+        let mut block = Block::<Simple>::new();
+        block
+            .push(vec![
+                ("ordinary".to_string(), Value::UInt8(7)),
+                ("tm".to_string(), map_value(key_type, &[(time64(0, 3), 1)])),
+            ])
+            .expect("the seed row must be accepted");
+        assert_eq!(
+            block.get_column("tm").unwrap().sql_type(),
+            SqlType::Map(key_type.clone().into(), SqlType::UInt8.into())
+        );
+        block
+    }
+
+    fn second_row(key_type: &SqlType, entries: &[(Time64, u8)]) -> Vec<(String, Value)> {
+        vec![
+            ("ordinary".to_string(), Value::UInt8(8)),
+            ("tm".to_string(), map_value(key_type, entries)),
+        ]
+    }
+
+    fn assert_collision_rejection(error: &Error, case: &str) {
+        assert!(
+            matches!(error, Error::Other(_)),
+            "{case}: expected the Time64 map key collision guard to reject the row, \
+             got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("Time64") && message.contains("collide"),
+            "{case}: expected a Time64 map key collision diagnostic, got `{message}`"
+        );
+    }
+
+    let wrapped_key = SqlType::SimpleAggregateFunction(SimpleAggFunc::Any, sql_time64(3).into());
+    let direct_key = sql_time64(3);
+    let colliding = [(time64(1, 0), 10), (time64(1_000, 3), 20)];
+    let distinct = [(time64(1, 0), 10), (time64(2_000, 3), 20)];
+
+    // Control: the direct key guard rejects the same pair of keys.
+    let mut direct = seeded_block(&direct_key);
+    let before_direct = snapshot(&direct);
+    let direct_error = direct
+        .push(second_row(&direct_key, &colliding))
+        .expect_err("Map(Time64(3), UInt8) must reject keys that collide after normalization");
+    assert_collision_rejection(&direct_error, "direct collision");
+    assert_unmutated(&direct, &before_direct, "direct collision");
+
+    // Control: mixed precision keys that stay distinct must still be accepted,
+    // through the direct key and through the wrapped key alike, and must read
+    // back normalized to the declared target precision.
+    for (case, key_type) in [("direct", &direct_key), ("wrapped", &wrapped_key)] {
+        let mut block = seeded_block(key_type);
+        block
+            .push(second_row(key_type, &distinct))
+            .unwrap_or_else(|error| panic!("{case} non-colliding keys must be accepted: {error}"));
+        let readback: HashMap<Time64, u8> = block.get(1, "tm").unwrap();
+        assert_eq!(
+            readback,
+            HashMap::from([(time64(1_000, 3), 10), (time64(2_000, 3), 20)]),
+            "{case} non-colliding keys must preserve both entries at precision 3"
+        );
+    }
+
+    // Control: a wrapped key that cannot be rescaled losslessly is still
+    // rejected, so the wrapper is already transparent to per-key validation.
+    let mut lossy = seeded_block(&wrapped_key);
+    let before_lossy = snapshot(&lossy);
+    assert!(lossy
+        .push(second_row(&wrapped_key, &[(time64(1, 6), 10)]))
+        .is_err());
+    assert_unmutated(&lossy, &before_lossy, "wrapped lossy key");
+
+    // Control: declared source metadata cannot disagree with the declared
+    // target key in either direction, so this is not a metadata-only bypass.
+    for (case, target, source) in [
+        ("wrapped target, direct source", &wrapped_key, &direct_key),
+        ("direct target, wrapped source", &direct_key, &wrapped_key),
+    ] {
+        let mut block = seeded_block(target);
+        let before = snapshot(&block);
+        let error = block
+            .push(second_row(source, &distinct))
+            .err()
+            .unwrap_or_else(|| panic!("{case} must be rejected"));
+        assert!(
+            matches!(error, Error::FromSql(FromSqlError::InvalidType { .. })),
+            "{case}: {error}"
+        );
+        assert_unmutated(&block, &before, case);
+    }
+
+    let mut wrapped = seeded_block(&wrapped_key);
+    let before_wrapped = snapshot(&wrapped);
+    let result = wrapped.push(second_row(&wrapped_key, &colliding));
+    if result.is_ok() {
+        let readback: HashMap<Time64, u8> = wrapped
+            .get(1, "tm")
+            .expect("the accepted map row must be readable");
+        panic!(
+            "Map(SimpleAggregateFunction(any, Time64(3)), UInt8) accepted the two distinct source \
+             keys Time64(1, precision 0) and Time64(1000, precision 3), which both normalize to \
+             coefficient 1000 at precision 3: push returned Ok and row 1 read back {} entry/entries \
+             from 2 distinct input keys (map column length {}, row count {}); the direct form \
+             rejects the same pair with: {direct_error}",
+            readback.len(),
+            wrapped.get_column("tm").unwrap().len(),
+            wrapped.row_count()
+        );
+    }
+    let error = result.unwrap_err();
+    assert_collision_rejection(&error, "wrapped collision");
+    assert_unmutated(&wrapped, &before_wrapped, "wrapped collision");
+}
+
+#[test]
+fn native_date32_time64_wrapped_time64_map_guard_preserves_validation_precedence() {
+    fn map_value(key_type: &SqlType, entries: &[(Time64, Time64)], reverse: bool) -> Value {
+        let mut map = HashMap::with_capacity(entries.len());
+        let ordered_entries: Box<dyn Iterator<Item = &(Time64, Time64)>> = if reverse {
+            Box::new(entries.iter().rev())
+        } else {
+            Box::new(entries.iter())
+        };
+        for (key, value) in ordered_entries {
+            map.insert(Value::Time64(*key), Value::Time64(*value));
+        }
+        assert_eq!(
+            map.len(),
+            entries.len(),
+            "the source keys must be distinct before any client-side normalization"
+        );
+        Value::Map(key_type.clone().into(), sql_time64(3).into(), Arc::new(map))
+    }
+
+    fn seeded_block(key_type: &SqlType) -> Block<Simple> {
+        let mut block = Block::<Simple>::new();
+        block
+            .push(vec![
+                ("ordinary".to_string(), Value::UInt8(7)),
+                (
+                    "tm".to_string(),
+                    map_value(key_type, &[(time64(0, 3), time64(0, 3))], false),
+                ),
+            ])
+            .expect("the seed row must be accepted");
+        assert_eq!(
+            block.get_column("tm").unwrap().sql_type(),
+            SqlType::Map(key_type.clone().into(), sql_time64(3).into())
+        );
+        block
+    }
+
+    fn second_row(
+        key_type: &SqlType,
+        entries: &[(Time64, Time64)],
+        reverse: bool,
+    ) -> Vec<(String, Value)> {
+        vec![
+            ("ordinary".to_string(), Value::UInt8(8)),
+            ("tm".to_string(), map_value(key_type, entries, reverse)),
+        ]
+    }
+
+    fn wrong_key_row(key_type: &SqlType, value: Time64) -> Vec<(String, Value)> {
+        vec![
+            ("ordinary".to_string(), Value::UInt8(8)),
+            (
+                "tm".to_string(),
+                Value::Map(
+                    key_type.clone().into(),
+                    sql_time64(3).into(),
+                    Arc::new(HashMap::from([(
+                        Value::Date32(date32(0)),
+                        Value::Time64(value),
+                    )])),
+                ),
+            ),
+        ]
+    }
+
+    let wrapped_key = SqlType::SimpleAggregateFunction(SimpleAggFunc::Any, sql_time64(3).into());
+    let valid_value = time64(0, 3);
+    let lossy_value = time64(1, 6);
+
+    let mut value_control = seeded_block(&wrapped_key);
+    let before_value_control = snapshot(&value_control);
+    let value_error = value_control
+        .push(second_row(
+            &wrapped_key,
+            &[(time64(2, 0), lossy_value)],
+            false,
+        ))
+        .expect_err("a Time64(6) value with coefficient 1 must not rescale to Time64(3)");
+    assert!(
+        value_error
+            .to_string()
+            .contains("cannot be rescaled from precision 6 to 3 without loss"),
+        "unexpected native value error: {value_error}"
+    );
+    assert_unmutated(
+        &value_control,
+        &before_value_control,
+        "non-colliding lossy native value",
+    );
+
+    for (association, entries) in [
+        (
+            "lossy value on precision-0 collision key",
+            [(time64(1, 0), lossy_value), (time64(1_000, 3), valid_value)],
+        ),
+        (
+            "lossy value on precision-3 collision key",
+            [(time64(1, 0), valid_value), (time64(1_000, 3), lossy_value)],
+        ),
+    ] {
+        for (construction, reverse) in [("forward insertion", false), ("reverse insertion", true)] {
+            let case = format!("{association}, {construction}");
+            let mut block = seeded_block(&wrapped_key);
+            let before = snapshot(&block);
+            let error = block
+                .push(second_row(&wrapped_key, &entries, reverse))
+                .expect_err("{case}: value validation must run before collision rejection");
+            assert_eq!(
+                error.to_string(),
+                value_error.to_string(),
+                "{case}: collision detection must not mask the native value error"
+            );
+            assert_unmutated(&block, &before, &case);
+        }
+    }
+
+    let overflow_key = time64(i64::MAX, 0);
+    let mut overflow_control = seeded_block(&wrapped_key);
+    let before_overflow_control = snapshot(&overflow_control);
+    let overflow_error = overflow_control
+        .push(second_row(
+            &wrapped_key,
+            &[(overflow_key, valid_value)],
+            false,
+        ))
+        .expect_err("overflowing Time64 key must be rejected");
+    assert!(
+        overflow_error.to_string().contains("overflows i64"),
+        "unexpected native key overflow error: {overflow_error}"
+    );
+    assert_unmutated(
+        &overflow_control,
+        &before_overflow_control,
+        "overflowing native key control",
+    );
+
+    let mut overflow_with_lossy_value = seeded_block(&wrapped_key);
+    let before_overflow_with_lossy_value = snapshot(&overflow_with_lossy_value);
+    let error = overflow_with_lossy_value
+        .push(second_row(
+            &wrapped_key,
+            &[(overflow_key, lossy_value)],
+            false,
+        ))
+        .expect_err("overflowing Time64 key must be rejected before its invalid value");
+    assert_eq!(
+        error.to_string(),
+        overflow_error.to_string(),
+        "key overflow must precede native value validation"
+    );
+    assert_unmutated(
+        &overflow_with_lossy_value,
+        &before_overflow_with_lossy_value,
+        "overflowing native key with lossy native value",
+    );
+
+    let mut wrong_key_control = seeded_block(&wrapped_key);
+    let before_wrong_key_control = snapshot(&wrong_key_control);
+    let wrong_key_error = wrong_key_control
+        .push(wrong_key_row(&wrapped_key, valid_value))
+        .expect_err("Date32 key must not satisfy a declared Time64 key type");
+    assert!(
+        matches!(
+            wrong_key_error,
+            Error::FromSql(FromSqlError::InvalidType { .. })
+        ),
+        "unexpected native key variant error: {wrong_key_error}"
+    );
+    assert_unmutated(
+        &wrong_key_control,
+        &before_wrong_key_control,
+        "wrong native key variant control",
+    );
+
+    let mut wrong_key_with_lossy_value = seeded_block(&wrapped_key);
+    let before_wrong_key_with_lossy_value = snapshot(&wrong_key_with_lossy_value);
+    let error = wrong_key_with_lossy_value
+        .push(wrong_key_row(&wrapped_key, lossy_value))
+        .expect_err("wrong native key variant must be rejected before its invalid value");
+    assert_eq!(
+        error.to_string(),
+        wrong_key_error.to_string(),
+        "wrong native key validation must precede native value validation"
+    );
+    assert_unmutated(
+        &wrong_key_with_lossy_value,
+        &before_wrong_key_with_lossy_value,
+        "wrong native key variant with lossy native value",
     );
 }

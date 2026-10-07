@@ -436,6 +436,15 @@ impl SqlType {
     }
 
     #[inline]
+    pub(crate) fn without_simple_aggregate_function(&self) -> &Self {
+        let mut sql_type = self;
+        while let SqlType::SimpleAggregateFunction(_, inner) = sql_type {
+            sql_type = inner;
+        }
+        sql_type
+    }
+
+    #[inline]
     pub(crate) fn contains_native_temporal(&self) -> bool {
         match self {
             SqlType::Date32 | SqlType::Time64(_) => true,

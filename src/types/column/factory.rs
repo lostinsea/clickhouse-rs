@@ -317,11 +317,9 @@ fn parse_map_type(source: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_simple_agg_fun(source: &str) -> Option<(SimpleAggFunc, &str)> {
-    if !source.starts_with("SimpleAggregateFunction(") || !source.ends_with(')') {
-        return None;
-    }
-
-    let args = source[23..].trim_matches(|c| c == '(' || c == ')');
+    let args = source
+        .strip_prefix("SimpleAggregateFunction(")?
+        .strip_suffix(')')?;
     let sep_index = args.find(',')?;
 
     let agg_func = args[..sep_index].trim();
@@ -783,6 +781,56 @@ mod test {
         let expected = Some((SimpleAggFunc::Sum, "Double"));
         let actual = parse_simple_agg_fun("SimpleAggregateFunction( sum , Double )");
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_parse_simple_agg_fun_strips_one_outer_delimiter_pair() {
+        assert_eq!(
+            parse_simple_agg_fun("SimpleAggregateFunction(anyLast, Time64(6))"),
+            Some((SimpleAggFunc::AnyLast, "Time64(6)"))
+        );
+
+        for (source, expected) in [
+            (
+                "SimpleAggregateFunction(any, Date32)",
+                (SimpleAggFunc::Any, "Date32"),
+            ),
+            (
+                "SimpleAggregateFunction(sum, Decimal(18, 4))",
+                (SimpleAggFunc::Sum, "Decimal(18, 4)"),
+            ),
+            (
+                "SimpleAggregateFunction(anyLast, DateTime64(3, 'UTC'))",
+                (SimpleAggFunc::AnyLast, "DateTime64(3, 'UTC')"),
+            ),
+            (
+                "SimpleAggregateFunction(any, FixedString(16))",
+                (SimpleAggFunc::Any, "FixedString(16)"),
+            ),
+            (
+                "SimpleAggregateFunction(anyLast, Nullable(Time64(6)))",
+                (SimpleAggFunc::AnyLast, "Nullable(Time64(6))"),
+            ),
+            (
+                "SimpleAggregateFunction(groupArrayArray, Array(Time64(6)))",
+                (SimpleAggFunc::GroupArrayArray, "Array(Time64(6))"),
+            ),
+        ] {
+            assert_eq!(parse_simple_agg_fun(source), Some(expected), "{source}");
+        }
+
+        assert_eq!(
+            parse_simple_agg_fun("SimpleAggregateFunction(anyLast, Time64(6)"),
+            Some((SimpleAggFunc::AnyLast, "Time64(6"))
+        );
+
+        for source in [
+            "SimpleAggregateFunction(Time64(6))",
+            "SimpleAggregateFunction(notAnAggregate, Time64(6))",
+            "Map(UInt8, UInt8)",
+        ] {
+            assert_eq!(parse_simple_agg_fun(source), None, "{source}");
+        }
     }
 
     #[test]

@@ -57,6 +57,21 @@ timestamps. Nullable and array values can be supplied through the existing
 where the server accepts the schema. All-null and empty Time64 containers
 need an explicit precision; there is no implicit precision for
 `Option<Time64>` or `Vec<Time64>`.
+
+`SimpleAggregateFunction(F, Date32)` and `SimpleAggregateFunction(F, Time64(P))`
+support `Block::get`, `Row::get`, and typed column iteration, preserving native
+values, precision, and declared wrapper metadata. Headers retain inner type
+names and parameters. Combining `SimpleAggregateFunction` and `LowCardinality`
+in either nesting order remains unsupported for native typed iteration; no
+generic aggregate-wrapped container iterator dispatch is added.
+
+`Time64` map keys normalize to the declared key precision, so distinct source
+precisions can produce colliding keys. Built-in row APIs reject such collisions
+before any column mutation, including for `SimpleAggregateFunction`-wrapped
+keys, after strict declared metadata validation. Supply exact wrapped key
+metadata through `Value::Map`; the convenience `HashMap` conversion does not
+declare a `SimpleAggregateFunction` wrapper.
+
 ClickHouse 26.5 accepts `LowCardinality(Date32)` with
 `allow_suspicious_low_cardinality_types=1`, but rejects
 `LowCardinality(Time64(P))` and `LowCardinality(Nullable(Time64(P)))`

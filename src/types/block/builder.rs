@@ -262,18 +262,25 @@ fn validate_native_value(sql_type: &SqlType, value: &Value) -> Result<()> {
         (SqlType::Map(key, value_type), Value::Map(source_key, source_value, entries)) => {
             validate_declared_type(key, source_key)?;
             validate_declared_type(value_type, source_value)?;
-            let mut normalized_keys = if matches!(*key, SqlType::Time64(_)) {
+            let effective_key = key.without_simple_aggregate_function();
+            let mut normalized_keys = if matches!(effective_key, SqlType::Time64(_)) {
                 Some(HashSet::with_capacity(entries.len()))
             } else {
                 None
             };
             for (entry_key, entry_value) in entries.iter() {
-                validate_native_value(key, entry_key)?;
+                let normalized_key = match (effective_key, entry_key) {
+                    (SqlType::Time64(precision), Value::Time64(time)) => {
+                        // Keep this check aligned with the scalar Time64 validation arm.
+                        Some(time.rescale(precision.get())?.coefficient())
+                    }
+                    _ => {
+                        validate_native_value(key, entry_key)?;
+                        None
+                    }
+                };
                 validate_native_value(value_type, entry_value)?;
-                if let (SqlType::Time64(precision), Value::Time64(time), Some(keys)) =
-                    (*key, entry_key, &mut normalized_keys)
-                {
-                    let normalized = time.rescale(precision.get())?.coefficient();
+                if let (Some(normalized), Some(keys)) = (normalized_key, &mut normalized_keys) {
                     if !keys.insert(normalized) {
                         return Err(Error::Other(
                             "Time64 map keys collide after precision conversion".into(),

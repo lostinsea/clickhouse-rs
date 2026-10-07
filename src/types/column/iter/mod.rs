@@ -28,11 +28,7 @@ use crate::{
 };
 
 fn check_type(src: &SqlType, dst: &SqlType) -> bool {
-    if let SqlType::SimpleAggregateFunction(_, nested) = src {
-        check_type(nested, dst)
-    } else {
-        src == dst
-    }
+    src.without_simple_aggregate_function() == dst
 }
 
 macro_rules! simple_num_iterable {
@@ -1201,9 +1197,12 @@ impl<'a> Iterable<'a, Simple> for Date32 {
         column_type: SqlType,
         props: u32,
     ) -> Result<Self::Iter> {
-        let low_cardinality = match column_type {
-            SqlType::Date32 => false,
-            SqlType::LowCardinality(SqlType::Date32) => true,
+        let low_cardinality = match (
+            column_type.without_simple_aggregate_function(),
+            &column_type,
+        ) {
+            (SqlType::Date32, _) => false,
+            (_, SqlType::LowCardinality(SqlType::Date32)) => true,
             _ => {
                 return Err(Error::FromSql(FromSqlError::InvalidType {
                     src: column_type.to_string(),
@@ -1230,9 +1229,12 @@ impl<'a> Iterable<'a, Simple> for Time64 {
         column_type: SqlType,
         props: u32,
     ) -> Result<Self::Iter> {
-        let (precision, low_cardinality) = match column_type {
-            SqlType::Time64(precision) => (precision, false),
-            SqlType::LowCardinality(SqlType::Time64(precision)) => (*precision, true),
+        let (precision, low_cardinality) = match (
+            column_type.without_simple_aggregate_function(),
+            &column_type,
+        ) {
+            (SqlType::Time64(precision), _) => (*precision, false),
+            (_, SqlType::LowCardinality(SqlType::Time64(precision))) => (*precision, true),
             _ => {
                 return Err(Error::FromSql(FromSqlError::InvalidType {
                     src: column_type.to_string(),
